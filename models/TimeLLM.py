@@ -5,7 +5,7 @@ import torch.nn as nn
 
 from transformers import LlamaConfig, LlamaModel, LlamaTokenizer, GPT2Config, GPT2Model, GPT2Tokenizer, BertConfig, \
     BertModel, BertTokenizer
-from layers.Embed import PatchEmbedding
+from layers.Embed import PatchEmbedding, LanguagePatchEmbedding
 import transformers
 from layers.StandardNorm import Normalize
 
@@ -29,7 +29,7 @@ class FlattenHead(nn.Module):
 
 class Model(nn.Module):
 
-    def __init__(self, configs, patch_len=16, stride=8):
+    def __init__(self, configs, patch_len=16, stride=8, dataset_minmax=None):
         super(Model, self).__init__()
         self.task_name = configs.task_name
         self.pred_len = configs.pred_len
@@ -39,6 +39,10 @@ class Model(nn.Module):
         self.d_llm = configs.llm_dim
         self.patch_len = configs.patch_len
         self.stride = configs.stride
+
+        # for DICE
+        if not dataset_minmax is None:
+            self.dataset_minmax = torch.stack([torch.tensor(x) for x in dataset_minmax])
 
         if configs.llm_model == 'LLAMA':
             # self.llama_config = LlamaConfig.from_pretrained('/mnt/alps/modelhub/pretrained_model/LLaMA/7B_hf/')
@@ -170,15 +174,23 @@ class Model(nn.Module):
 
         self.dropout = nn.Dropout(configs.dropout)
 
-        self.patch_embedding = PatchEmbedding(
-            configs.d_model, self.patch_len, self.stride, configs.dropout)
+        if configs.use_DICE is None:
+            # patch len 16, stride 8
+            self.patch_embedding = PatchEmbedding(
+                configs.d_model, self.patch_len, self.stride, configs.dropout)
+        else:
+            # stride = patch_len because of DICE 
+            self.patch_embedding = LanguagePatchEmbedding(
+                configs.d_model, self.patch_len, self.patch_len, configs.dropout, configs.use_DICE)
+        self.use_DICE = configs.use_DICE
 
         self.word_embeddings = self.llm_model.get_input_embeddings().weight
         self.vocab_size = self.word_embeddings.shape[0]
         self.num_tokens = 1000
         self.mapping_layer = nn.Linear(self.vocab_size, self.num_tokens)
 
-        self.reprogramming_layer = ReprogrammingLayer(configs.d_model, configs.n_heads, self.d_ff, self.d_llm)
+        self.reprogramming_layer = ReprogrammingLayer(configs.d_model, configs.n_heads, self.d_ff, self.d_llm, 
+                                                        DICE_embedding=not configs.use_DICE is None)
 
         self.patch_nums = int((configs.seq_len - self.patch_len) / self.stride + 2)
         self.head_nf = self.d_ff * self.patch_nums
@@ -202,14 +214,27 @@ class Model(nn.Module):
         x_enc = self.normalize_layers(x_enc, 'norm')
 
         B, T, N = x_enc.size()
-        x_enc = x_enc.permute(0, 2, 1).contiguous().reshape(B * N, T, 1)
+        if not self.use_DICE:
+            x_enc = x_enc.permute(0, 2, 1).contiguous().reshape(B * N, T, 1)
+        else:
+            x_enc = x_enc.permute(0, 2, 1).contiguous().reshape(B, N * T, 1)
 
-        min_values = torch.min(x_enc, dim=1)[0]
-        max_values = torch.max(x_enc, dim=1)[0]
-        medians = torch.median(x_enc, dim=1).values
-        lags = self.calcute_lags(x_enc)
-        trends = x_enc.diff(dim=1).sum(dim=1)
-
+        if self.use_DICE is None:
+            min_values = torch.min(x_enc, dim=1)[0]
+            max_values = torch.max(x_enc, dim=1)[0]
+            medians = torch.median(x_enc, dim=1).values
+            lags = self.calcute_lags(x_enc)
+            trends = x_enc.diff(dim=1).sum(dim=1)
+        else:
+            self.dataset_minmax = self.dataset_minmax.to(x_enc.device)
+            min_values = torch.min(x_enc * (self.dataset_minmax[1] - self.dataset_minmax[0]) + self.dataset_minmax[0], dim=1)[0]
+            max_values = torch.max(x_enc * (self.dataset_minmax[1] - self.dataset_minmax[0]) + self.dataset_minmax[0], dim=1)[0]
+            medians = torch.median(x_enc * (self.dataset_minmax[1] - self.dataset_minmax[0]) + self.dataset_minmax[0], dim=1).values
+            lags = self.calcute_lags(x_enc * (self.dataset_minmax[1] - self.dataset_minmax[0]) + self.dataset_minmax[0])
+            
+            # Default target variable index = 0 (HEURISTIC)
+            trends = (x_enc * (self.dataset_minmax[1][0] - self.dataset_minmax[0][0]) + self.dataset_minmax[0][0]).diff(dim=1).sum(dim=1)
+ 
         prompt = []
         for b in range(x_enc.shape[0]):
             min_values_str = str(min_values[b].tolist()[0])
@@ -234,11 +259,18 @@ class Model(nn.Module):
         prompt = self.tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=2048).input_ids
         prompt_embeddings = self.llm_model.get_input_embeddings()(prompt.to(x_enc.device))  # (batch, prompt_token, dim)
 
+        # Linear(LLM vocabulary weight) -> 1000
         source_embeddings = self.mapping_layer(self.word_embeddings.permute(1, 0)).permute(1, 0)
 
         x_enc = x_enc.permute(0, 2, 1).contiguous()
+        
+        # window + conv1d: For DICE: n_vars = 100 
+        # L=512 -> 64 x 32 = 2048
         enc_out, n_vars = self.patch_embedding(x_enc.to(torch.bfloat16))
+        
+        # 64 x 32 -> 64 x d_model
         enc_out = self.reprogramming_layer(enc_out, source_embeddings, source_embeddings)
+
         llama_enc_out = torch.cat([prompt_embeddings, enc_out], dim=1)
         dec_out = self.llm_model(inputs_embeds=llama_enc_out).last_hidden_state
         dec_out = dec_out[:, :, :self.d_ff]
@@ -265,12 +297,15 @@ class Model(nn.Module):
 
 
 class ReprogrammingLayer(nn.Module):
-    def __init__(self, d_model, n_heads, d_keys=None, d_llm=None, attention_dropout=0.1):
+    def __init__(self, d_model, n_heads, d_keys=None, d_llm=None, attention_dropout=0.1, DICE_embedding=False):
         super(ReprogrammingLayer, self).__init__()
 
         d_keys = d_keys or (d_model // n_heads)
-
-        self.query_projection = nn.Linear(d_model, d_keys * n_heads)
+        
+        self.DICE_embedding = DICE_embedding
+        if not self.DICE_embedding:
+            self.query_projection = nn.Linear(d_model, d_keys * n_heads)
+        
         self.key_projection = nn.Linear(d_llm, d_keys * n_heads)
         self.value_projection = nn.Linear(d_llm, d_keys * n_heads)
         self.out_projection = nn.Linear(d_keys * n_heads, d_llm)
@@ -278,11 +313,17 @@ class ReprogrammingLayer(nn.Module):
         self.dropout = nn.Dropout(attention_dropout)
 
     def forward(self, target_embedding, source_embedding, value_embedding):
+        
+        # S = 1000
         B, L, _ = target_embedding.shape
         S, _ = source_embedding.shape
         H = self.n_heads
 
-        target_embedding = self.query_projection(target_embedding).view(B, L, H, -1)
+        if not self.DICE_embedding:
+            target_embedding = self.query_projection(target_embedding).view(B, L, H, -1)
+        else:
+            target_embedding = target_embedding.view(B, L, H, -1)
+        
         source_embedding = self.key_projection(source_embedding).view(S, H, -1)
         value_embedding = self.value_projection(value_embedding).view(S, H, -1)
 

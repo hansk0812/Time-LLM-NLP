@@ -7,6 +7,8 @@ from utils.timefeatures import time_features
 from data_provider.m4 import M4Dataset, M4Meta
 import warnings
 
+from data_provider.dice_embedding import DICE 
+
 warnings.filterwarnings('ignore')
 
 
@@ -210,7 +212,8 @@ class Dataset_Custom(Dataset):
     def __init__(self, root_path, flag='train', size=None,
                  features='S', data_path='ETTh1.csv',
                  target='OT', scale=True, timeenc=0, freq='h', percent=100,
-                 seasonal_patterns=None):
+                 seasonal_patterns=None, language_embeddings=None):
+                 # language_embeddings are DICE-based
         if size == None:
             self.seq_len = 24 * 4 * 4
             self.label_len = 24 * 4
@@ -233,8 +236,16 @@ class Dataset_Custom(Dataset):
 
         self.root_path = root_path
         self.data_path = data_path
+
+        self.language_embeddings = language_embeddings
         self.__read_data__()
 
+        if not language_embeddings is None:
+            # 6-digit default
+            self.dice_model = DICE(
+                d=self.language_embeddings, 
+                min_bound=100000, max_bound=999999, norm="l2", save_path="BPE")
+        
         self.enc_in = self.data_x.shape[-1]
         self.tot_len = len(self.data_x) - self.seq_len - self.pred_len + 1
 
@@ -266,14 +277,32 @@ class Dataset_Custom(Dataset):
             df_data = df_raw[cols_data]
         elif self.features == 'S':
             df_data = df_raw[[self.target]]
-
+        
+        if not self.language_embeddings is None and not self.scale:
+            train_data = df_data[border1s[0]:border2s[0]]
+            self.minmax = [pd.Series(train_data.values.min(axis=0), index=train_data.columns), 
+                           pd.Series(train_data.values.max(axis=0), index=train_data.columns)]
+        
         if self.scale:
             train_data = df_data[border1s[0]:border2s[0]]
             self.scaler.fit(train_data.values)
             data = self.scaler.transform(df_data.values)
+
+            if not self.language_embeddings is None:
+                self.minmax = [data.min(axis=0), data.max(axis=0)]
         else:
             data = df_data.values
 
+        if not self.language_embeddings is None:
+            N = len(data)
+            mask = ((data >= self.minmax[0][np.newaxis,:]) & (data <= self.minmax[1][np.newaxis,:])).all(axis=1)
+            data = data[mask]
+            if len(data) < N:
+                print ("Reduced number of timesteps (out of range) from %d to %d" % (N, len(data)))
+            
+            data = np.power(10, 6) * (data - self.minmax[0]) / (self.minmax[1] - self.minmax[0])
+            data = data.astype(np.int32)
+            
         df_stamp = df_raw[['date']][border1:border2]
         df_stamp['date'] = pd.to_datetime(df_stamp.date)
         if self.timeenc == 0:
@@ -302,6 +331,16 @@ class Dataset_Custom(Dataset):
         seq_x_mark = self.data_stamp[s_begin:s_end]
         seq_y_mark = self.data_stamp[r_begin:r_end]
 
+        if not self.language_embeddings is None:
+            x_shape, y_shape = seq_x.shape + (-1,), seq_y.shape + (-1,) # -1 for DICE embedding dimension
+            
+            seq_x, seq_y = seq_x.reshape((-1)), seq_y.reshape((-1))
+            seq_x, seq_y = self.dice_model.make_dice(seq_x), self.dice_model.make_dice(seq_y)
+            seq_x, seq_y = seq_x.reshape(x_shape), seq_y.reshape(y_shape)
+            
+            xs, ys = seq_x.shape, seq_y.shape 
+            seq_x, seq_y = seq_x.reshape((xs[0], xs[1]*xs[2])), seq_y.reshape((ys[0], ys[1]*ys[2]))
+
         return seq_x, seq_y, seq_x_mark, seq_y_mark
 
     def __len__(self):
@@ -309,6 +348,9 @@ class Dataset_Custom(Dataset):
 
     def inverse_transform(self, data):
         return self.scaler.inverse_transform(data)
+
+    def get_DICE_integers(self, embeddings):
+        return self.dice_model.get_number(embeddings)
 
 
 class Dataset_M4(Dataset):

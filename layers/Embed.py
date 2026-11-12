@@ -5,6 +5,7 @@ from torch import Tensor
 from torch.nn.utils import weight_norm
 import math
 
+from .dice_embedding import DICE
 
 class PositionalEmbedding(nn.Module):
     def __init__(self, d_model, max_len=5000):
@@ -182,6 +183,41 @@ class PatchEmbedding(nn.Module):
         x = torch.reshape(x, (x.shape[0] * x.shape[1], x.shape[2], x.shape[3]))
         # Input encoding
         x = self.value_embedding(x)
+        return self.dropout(x), n_vars
+
+
+class LanguagePatchEmbedding(nn.Module):
+    def __init__(self, d_model, patch_len, stride, dropout, DICE_len):
+        super(LanguagePatchEmbedding, self).__init__()
+        # Patching
+        self.patch_len = patch_len
+        self.stride = stride
+        self.padding_patch_layer = ReplicationPad1d((0, stride))
+
+        self.DICE_len = DICE_len
+        # Backbone, Input encoding: projection of feature vectors onto a d-dim vector space
+        self.value_embedding = TokenEmbedding(patch_len, d_model)
+
+        # Positional embedding
+        # self.position_embedding = PositionalEmbedding(d_model)
+
+        self.linear = nn.Linear(DICE_len, 32)
+
+        # Residual dropout
+        self.dropout = nn.Dropout(0)
+
+    def forward(self, x):
+        # do patching
+        n_vars = x.shape[1] // self.DICE_len
+        #x = self.padding_patch_layer(x) Input dim always a multiple of patch size 16
+        x = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
+        x = torch.reshape(x, (x.shape[0] * x.shape[1], x.shape[2], x.shape[3]))
+        # Input encoding
+        x = self.value_embedding(x) 
+        B = x.shape[0] // self.DICE_len
+        x = x.reshape((B, self.DICE_len, -1)).transpose(1, 2) # UNIVARIATE CASE ONLY!
+        x = self.linear(x).transpose(1, 2) # DICE_len -> 32
+        
         return self.dropout(x), n_vars
 
 
